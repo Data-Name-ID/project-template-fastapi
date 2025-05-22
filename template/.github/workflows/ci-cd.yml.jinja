@@ -1,0 +1,254 @@
+name: CI/CD
+
+on:
+  push:
+    branches:
+      - '**'
+  pull_request:
+    branches:
+      - '**'
+
+permissions:
+  contents: read
+  packages: write
+  id-token: write
+
+concurrency:
+  group: ${% raw %}{{ github.workflow }}{% endraw %}-${% raw %}{{ github.ref }}{% endraw %}
+  cancel-in-progress: true
+
+env:
+  REGISTRY: ghcr.io
+
+jobs:
+  uv:
+    runs-on: ubuntu-latest
+    name: 📦 uv
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Check lock file
+        run: uv lock --check
+
+  ruff:
+    runs-on: ubuntu-latest
+    name: 🧹 ruff
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install ruff
+        uses: astral-sh/ruff-action@v3
+
+  mypy:
+    runs-on: ubuntu-latest
+    name: 🔍 mypy
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Run mypy
+        run: uv run mypy .
+
+  build:
+    name: 🐳 Build & Push
+    needs: uv
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev'
+    environment:
+      name: ${% raw %}{{ github.ref == 'refs/heads/main' && 'production' || 'development' }}{% endraw %}
+    outputs:
+      image-tag: ${% raw %}{{ steps.set-tag.outputs.image-tag }}{% endraw %}
+      migrate-image-tag: ${% raw %}{{ steps.set-tag.outputs.migrate-image-tag }}{% endraw %}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Determine environment
+        id: env
+        run: |
+          [[ "${GITHUB_REF##*/}" = "dev" ]] \
+            && echo "environment=dev" >> $GITHUB_OUTPUT \
+            || echo "environment=prod" >> $GITHUB_OUTPUT
+
+      - name: Normalize repository name
+        run: |
+          echo "REPO_LOWER=$(echo $GITHUB_REPOSITORY | tr '[:upper:]' '[:lower:]')" >> $GITHUB_ENV
+
+      - name: Create JWT keys
+        env:
+          JWT_PUBLIC_KEY: ${% raw %}{{ secrets.JWT_PUBLIC_KEY }}{% endraw %}
+          JWT_PRIVATE_KEY: ${% raw %}{{ secrets.JWT_PRIVATE_KEY }}{% endraw %}
+        run: |
+          mkdir keys
+
+          echo "$JWT_PUBLIC_KEY" > keys/jwt-public.pem
+          echo "$JWT_PRIVATE_KEY" > keys/jwt-private.pem
+
+      - name: Create .env
+        env:
+          ENV: ${% raw %}{{ secrets.ENV }}{% endraw %}
+        run: |
+          echo "$ENV" > .env
+
+      - name: Setup Buildx
+        uses: docker/setup-buildx-action@v3
+        with:
+          install: true
+
+      - name: Login to GHCR via OIDC
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${% raw %}{{ github.actor }}{% endraw %}
+          password: ${% raw %}{{ secrets.GITHUB_TOKEN }}{% endraw %}
+
+      - name: Build & push migrate image
+        uses: docker/build-push-action@v4
+        with:
+          context: .
+          push: true
+          tags: |
+            ${% raw %}{{ env.REGISTRY }}{% endraw %}/${% raw %}{{ env.REPO_LOWER }}{% endraw %}-migrate:${% raw %}{{ github.sha }}{% endraw %}
+            ${% raw %}{{ env.REGISTRY }}{% endraw %}/${% raw %}{{ env.REPO_LOWER }}{% endraw %}-migrate:${% raw %}{{ steps.env.outputs.environment }}{% endraw %}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          target: migrate
+          build-args: |
+            APP_ENV=${% raw %}{{ steps.env.outputs.environment }}{% endraw %}
+
+      - name: Build & push app image
+        id: build-app
+        uses: docker/build-push-action@v4
+        with:
+          context: .
+          push: true
+          tags: |
+            ${% raw %}{{ env.REGISTRY }}{% endraw %}/${% raw %}{{ env.REPO_LOWER }}{% endraw %}:${% raw %}{{ github.sha }}{% endraw %}
+            ${% raw %}{{ env.REGISTRY }}{% endraw %}/${% raw %}{{ env.REPO_LOWER }}{% endraw %}:${% raw %}{{ steps.env.outputs.environment }}{% endraw %}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          target: app
+          build-args: |
+            APP_ENV=${% raw %}{{ steps.env.outputs.environment }}{% endraw %}
+
+      - name: Set image-tag
+        id: set-tag
+        run: |
+          echo "image-tag=${% raw %}{{ env.REGISTRY }}{% endraw %}/${% raw %}{{ env.REPO_LOWER }}{% endraw %}:${% raw %}{{ github.sha }}{% endraw %}" >> $GITHUB_OUTPUT
+          echo "migrate-image-tag=${% raw %}{{ env.REGISTRY }}{% endraw %}/${% raw %}{{ env.REPO_LOWER }}{% endraw %}-migrate:${% raw %}{{ github.sha }}{% endraw %}" >> $GITHUB_OUTPUT
+
+      - name: Cleanup
+        run: rm -rf keys .env
+
+  deploy:
+    name: 🚀 Deploy
+    needs: build
+    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev'
+    runs-on: ubuntu-latest
+    environment:
+      name: ${% raw %}{{ github.ref == 'refs/heads/main' && 'production' || 'development' }}{% endraw %}
+      url: ${% raw %}{{{% endraw %} github.ref == 'refs/heads/main' && 'https://{{ project_slug_with_dashes }}-backend.{{ domain_name }}/docs' || 'https://{{ project_slug_with_dashes }}-backend-dev.{{ domain_name }}/docs' {% raw %}}}{% endraw %}
+
+    steps:
+      - name: Prepare SSH
+        uses: webfactory/ssh-agent@v0.9.1
+        with:
+          ssh-private-key: ${% raw %}{{ secrets.SSH_KEY }}{% endraw %}
+
+      - name: Add host key
+        run: ssh-keyscan -H "${% raw %}{{ secrets.SSH_HOST }}{% endraw %}" >> ~/.ssh/known_hosts
+
+      - name: Determine deploy config
+        id: config
+        run: |
+          if [[ "${GITHUB_REF##*/}" == "main" ]]; then
+            echo "env=prod" >> $GITHUB_OUTPUT
+            echo "container={{ project_slug_with_dashes }}-backend-prod" >> $GITHUB_OUTPUT
+            echo "network=network-prod" >> $GITHUB_OUTPUT
+          else
+            echo "env=dev" >> $GITHUB_OUTPUT
+            echo "container={{ project_slug_with_dashes }}-backend-dev" >> $GITHUB_OUTPUT
+            echo "network=network-dev" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Remote deploy
+        run: |
+          ssh ${% raw %}{{ secrets.SSH_USER }}{% endraw %}@${% raw %}{{ secrets.SSH_HOST }}{% endraw %} bash -e <<EOF
+            echo ${% raw %}{{ secrets.GITHUB_TOKEN }}{% endraw %} | docker login ghcr.io -u ${% raw %}{{ github.actor }}{% endraw %} --password-stdin
+
+            docker run --rm \
+              --network ${% raw %}{{ steps.config.outputs.network }}{% endraw %} \
+              ${% raw %}{{ needs.build.outputs.migrate-image-tag }}{% endraw %}
+
+            docker stop ${% raw %}{{ steps.config.outputs.container }}{% endraw %} || true
+            docker rm ${% raw %}{{ steps.config.outputs.container }}{% endraw %} || true
+            docker image prune -f -a
+
+            docker run -d \
+              --name ${% raw %}{{ steps.config.outputs.container }}{% endraw %} \
+              --network ${% raw %}{{ steps.config.outputs.network }}{% endraw %} \
+              -p ${% raw %}{{ secrets.BACKEND__RUN__PORT }}{% endraw %}:8000 \
+              ${% raw %}{{ needs.build.outputs.image-tag }}{% endraw %}
+          EOF
+
+  notify:
+    name: 💬 Notify Telegram
+    needs: deploy
+    if: always()
+    runs-on: ubuntu-latest
+    env:
+      TELEGRAM_BOT_TOKEN: ${% raw %}{{ secrets.TELEGRAM_BOT_TOKEN }}{% endraw %}
+      TELEGRAM_CHAT_ID: ${% raw %}{{ secrets.TELEGRAM_CHAT_ID }}{% endraw %}
+      STATUS: ${% raw %}{{ needs.deploy.result }}{% endraw %}
+      COMMIT_SHA: ${% raw %}{{ github.sha }}{% endraw %}
+      COMMIT_URL: https://github.com/${% raw %}{{ github.repository }}{% endraw %}/commit/${% raw %}{{ github.sha }}{% endraw %}
+      ACTOR: ${% raw %}{{ github.actor }}{% endraw %}
+      RUN_URL: https://github.com/${% raw %}{{ github.repository }}{% endraw %}/actions/runs/${% raw %}{{ github.run_id }}{% endraw %}
+      REPO: ${% raw %}{{ github.repository }}{% endraw %}
+      BRANCH_NAME: ${% raw %}{{ github.ref_name }}{% endraw %}
+    steps:
+      - name: Send Telegram notification
+        run: |
+          if [[ "$GITHUB_REF" == "refs/heads/dev" ]]; then
+            ENV_NAME="DEV"
+          else
+            ENV_NAME="PROD"
+          fi
+
+          if [[ "$STATUS" == "success" ]]; then
+            EMOJI="✅"
+          else
+            EMOJI="❌"
+          fi
+
+          SHORT_SHA=${COMMIT_SHA:0:7}
+          NOW=$(date -u +"%d.%m.%Y %H:%M UTC")
+
+          TEXT="${EMOJI} *${ENV_NAME} ДЕПЛОЙ: ${STATUS^^}*
+
+          📦 *Проект:* ${REPO}
+          🔁 *Ветка:* ${BRANCH_NAME}
+          👤 *Автор:* ${ACTOR}
+
+          🧾 *Коммит:* [\`${SHORT_SHA}\`](${COMMIT_URL})
+          🕓 *Дата:* ${NOW}
+
+          🔗 [Перейти к билду](${RUN_URL})"
+
+          curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            -d chat_id="${TELEGRAM_CHAT_ID}" \
+            -d parse_mode="Markdown" \
+            --data-urlencode "text=${TEXT}"

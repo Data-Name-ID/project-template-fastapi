@@ -1,0 +1,45 @@
+# Git
+.git
+.gitignore
+
+# CI
+.github/
+
+# Docker
+docker-compose.yml
+Dockerfile
+.dockerignore
+
+# Byte-compiled / optimized / DLL files
+**/__pycache__/
+**/*.py[cod]
+
+# Logs:
+*.log
+
+# Virtual environment
+.venv/
+venv/
+
+# IDE
+.idea
+.vscode/
+
+# Mypy
+**/.mypy_cache/
+
+# Ruff
+**/.ruff_cache/
+
+# Docs
+README*
+
+# Pre-commit
+.pre-commit-config.yaml
+
+# Env
+.env.template
+.env.dev
+
+# Makefile
+Makefile

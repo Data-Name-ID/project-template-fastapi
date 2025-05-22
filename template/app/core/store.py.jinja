@@ -1,0 +1,39 @@
+import logging
+
+
+class Store:
+    def __init__(self) -> None:
+        from app.core.config import Config
+
+        self.config = Config()
+        self.logger = logging.getLogger("msu.store")
+
+        # core
+        {% if is_ai_needed -%}
+        from app.core.ai import AIAccessor
+        {% endif -%}
+        from app.core.db import DatabaseAccessor
+        from app.core.email import EmailManager
+        from app.core.jwt import JWTManager
+        {% if is_s3_needed -%}
+        from app.core.s3 import S3Accessor
+        {% endif -%}
+
+{% if is_ai_needed %}
+        self.ai = AIAccessor(self)
+        {% endif -%}
+        self.db = DatabaseAccessor(self)
+        self.email = EmailManager(self)
+        self.jwt = JWTManager(self)
+        {% if is_s3_needed -%}
+        self.s3 = S3Accessor(self)
+{% endif %}
+        # accessors
+        from app.api.users.accessor import UserAccessor
+
+        self.user_accessor = UserAccessor(self)
+
+        # managers
+        from app.api.users.manager import UserManager
+
+        self.user_manager = UserManager(self)

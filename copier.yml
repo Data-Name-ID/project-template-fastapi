@@ -1,0 +1,47 @@
+_subdirectory: template
+
+project_name:
+    type: str
+    help: Имя проекта (например, My project name)
+    default: My project name
+
+project_slug:
+  type: str
+  help: Имя проекта в формате slug (например, my_project_name)
+  default: |-
+    {{ project_name.lower().replace(' ', '_') }}
+
+project_slug_with_dashes:
+  type: str
+  help: Имя проекта в формате slug с дефисами (например, my-project-name)
+  default: |-
+    {{ project_name.lower().replace(' ', '-') }}
+
+domain_name:
+  type: str
+  help: Доменное имя (например, where-pizza.ru)
+  default: where-pizza.ru
+
+git_repository_url:
+  type: str
+  help: URL репозитория Git (например, git@github.com:username/repo.git)
+
+is_redis_needed:
+  type: bool
+  help: Вы хотите использовать Redis?
+  default: true
+
+is_rabbitmq_needed:
+  type: bool
+  help: Вы хотите использовать RabbitMQ?
+  default: true
+
+is_s3_needed:
+  type: bool
+  help: Вы хотите использовать S3?
+  default: true
+
+is_ai_needed:
+  type: bool
+  help: Вы хотите использовать AI?
+  default: true

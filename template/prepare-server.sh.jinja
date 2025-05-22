@@ -1,0 +1,425 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+IFS=$'\n\t'
+
+PROJECT_SLUG="{{ project_slug }}"
+PROJECT_SLUG_DASH="{{ project_slug_with_dashes }}"
+DOMAIN="{{ domain_name }}"
+DOCKER_USER="dn"
+
+CREDENTIALS_PATH="/opt/${PROJECT_SLUG}/secrets.env"
+GLOBAL_CREDS_PATH="/opt/secrets.env"
+DATA_BASE_PATH="/opt/data"
+
+DEV_NET="dev-network"
+PROD_NET="prod-network"
+
+POSTGRES_IMAGE="postgres:17-alpine"
+{% if is_s3_needed -%}
+MINIO_IMAGE="quay.io/minio/minio"
+{% endif -%}
+{% if is_redis_needed -%}
+REDIS_IMAGE="redis:8-alpine"
+{% endif -%}
+{% if is_rabbitmq_needed -%}
+RABBITMQ_IMAGE="rabbitmq:4-management"
+{% endif %}
+FRONTEND_PORT_START=3000
+BACKEND_PORT_START=8000
+
+log() { echo -e "\e[32m[INFO]\e[0m $*"; }
+warn() { echo -e "\e[33m[WARN]\e[0m $*"; }
+error() {
+  echo -e "\e[31m[ERROR]\e[0m $*" >&2
+  exit 1
+}
+
+[[ "$EUID" -eq 0 ]] || error "Скрипт должен быть запущен от root"
+command_exists() { command -v "$1" &>/dev/null; }
+
+ensure_apt_pkg() {
+  local pkg="$1"
+  dpkg -s "$pkg" &>/dev/null || {
+    log "Установка пакета $pkg"
+    apt-get install -y "$pkg"
+  }
+}
+
+generate_secret() {
+  local length=${1:-64}
+  openssl rand -base64 $((length * 2)) | tr -dc 'A-Za-z0-9' | head -c "$length"
+}
+
+find_free_port() {
+  local port=$1
+  while ss -ltn "sport = :$port" | grep -q LISTEN; do
+    ((port++))
+  done
+  echo "$port"
+}
+
+ensure_docker_network() {
+  local net="$1"
+  if ! docker network inspect "$net" &>/dev/null; then
+    log "Создаём Docker сеть: $net"
+    docker network create "$net"
+  else
+    log "Docker сеть $net уже существует"
+  fi
+}
+
+ensure_container() {
+  local name="$1" opts="${2:---restart=unless-stopped}"
+  shift 2
+  if ! docker ps -a --format '{% raw %}{{.Names}}{% endraw %}' | grep -qx "$name"; then
+    log "Запуск контейнера $name"
+    docker run -d --name "$name" $opts "$@"
+  elif ! docker ps --format '{% raw %}{{.Names}}{% endraw %}' | grep -qx "$name"; then
+    log "Запуск существующего контейнера $name"
+    docker start "$name"
+  else
+    log "Контейнер $name уже запущен"
+  fi
+}
+
+log "Обновление системы и установка nginx, Docker"
+apt-get update -qq
+ensure_apt_pkg dialog
+export DEBIAN_FRONTEND=noninteractive
+apt-get upgrade -y -qq
+ensure_apt_pkg curl
+ensure_apt_pkg nginx
+
+if ! command_exists docker; then
+  log "Установка Docker"
+  curl -fsSL https://get.docker.com | sh
+fi
+
+if id "$DOCKER_USER" &>/dev/null; then
+  if getent group docker &>/dev/null; then
+    log "Добавление пользователя $DOCKER_USER в группу docker"
+    usermod -aG docker "$DOCKER_USER"
+    log "Пользователь $DOCKER_USER добавлен в группу docker"
+  else
+    warn "Группа docker не существует. Пропускаем добавление пользователя."
+  fi
+else
+  warn "Пользователь $DOCKER_USER не существует. Пропускаем добавление в группу docker."
+fi
+
+mkdir -p "$DATA_BASE_PATH"
+mkdir -p "$(dirname "$CREDENTIALS_PATH")"
+mkdir -p "$(dirname "$GLOBAL_CREDS_PATH")"
+
+if [[ ! -f "$GLOBAL_CREDS_PATH" ]]; then
+  log "Генерация глобальных учётных данных"
+
+  SUF_DEV=$(openssl rand -hex 4)
+  SUF_PROD=$(openssl rand -hex 4)
+
+  GLOBAL_POSTGRES_USER_DEV="postgres_dev_${SUF_DEV}"
+  GLOBAL_POSTGRES_PASS_DEV=$(generate_secret 32)
+  GLOBAL_POSTGRES_USER_PROD="postgres_prod_${SUF_PROD}"
+  GLOBAL_POSTGRES_PASS_PROD=$(generate_secret 32)
+
+  {% if is_s3_needed -%}
+  GLOBAL_MINIO_USER_DEV="minio_dev_${SUF_DEV}"
+  GLOBAL_MINIO_PASS_DEV=$(generate_secret 32)
+  GLOBAL_MINIO_USER_PROD="minio_prod_${SUF_PROD}"
+  GLOBAL_MINIO_PASS_PROD=$(generate_secret 32)
+  {% endif %}
+  {% if is_redis_needed -%}
+  GLOBAL_REDIS_PASS_DEV=$(generate_secret 32)
+  GLOBAL_REDIS_PASS_PROD=$(generate_secret 32)
+  {% endif %}
+  {% if is_rabbitmq_needed -%}
+  GLOBAL_RABBITMQ_USER_DEV="rabbit_dev_${SUF_DEV}"
+  GLOBAL_RABBITMQ_PASS_DEV=$(generate_secret 32)
+  GLOBAL_RABBITMQ_USER_PROD="rabbit_prod_${SUF_PROD}"
+  GLOBAL_RABBITMQ_PASS_PROD=$(generate_secret 32)
+  {% endif %}
+  cat >"$GLOBAL_CREDS_PATH" <<EOF
+GLOBAL_POSTGRES_USER_DEV=$GLOBAL_POSTGRES_USER_DEV
+GLOBAL_POSTGRES_PASS_DEV=$GLOBAL_POSTGRES_PASS_DEV
+GLOBAL_POSTGRES_USER_PROD=$GLOBAL_POSTGRES_USER_PROD
+GLOBAL_POSTGRES_PASS_PROD=$GLOBAL_POSTGRES_PASS_PROD
+
+{% if is_s3_needed -%}
+GLOBAL_MINIO_USER_DEV=$GLOBAL_MINIO_USER_DEV
+GLOBAL_MINIO_PASS_DEV=$GLOBAL_MINIO_PASS_DEV
+GLOBAL_MINIO_USER_PROD=$GLOBAL_MINIO_USER_PROD
+GLOBAL_MINIO_PASS_PROD=$GLOBAL_MINIO_PASS_PROD
+{% endif %}
+{% if is_redis_needed -%}
+GLOBAL_REDIS_PASS_DEV=$GLOBAL_REDIS_PASS_DEV
+GLOBAL_REDIS_PASS_PROD=$GLOBAL_REDIS_PASS_PROD
+{% endif %}
+{% if is_rabbitmq_needed -%}
+GLOBAL_RABBITMQ_USER_DEV=$GLOBAL_RABBITMQ_USER_DEV
+GLOBAL_RABBITMQ_PASS_DEV=$GLOBAL_RABBITMQ_PASS_DEV
+GLOBAL_RABBITMQ_USER_PROD=$GLOBAL_RABBITMQ_USER_PROD
+GLOBAL_RABBITMQ_PASS_PROD=$GLOBAL_RABBITMQ_PASS_PROD
+{% endif -%}
+EOF
+  chmod 600 "$GLOBAL_CREDS_PATH"
+  chown root:root "$GLOBAL_CREDS_PATH"
+else
+  log "Загрузка существующих глобальных креденшалов"
+  source "$GLOBAL_CREDS_PATH"
+fi
+
+ensure_docker_network "$DEV_NET"
+ensure_docker_network "$PROD_NET"
+
+ensure_container "postgres-dev" \
+  -e POSTGRES_USER="$GLOBAL_POSTGRES_USER_DEV" \
+  -e POSTGRES_PASSWORD="$GLOBAL_POSTGRES_PASS_DEV" \
+  --network "$DEV_NET" \
+  -v "$DATA_BASE_PATH/postgres-dev:/var/lib/postgresql/data" \
+  "$POSTGRES_IMAGE"
+ensure_container "postgres-prod" \
+  -e POSTGRES_USER="$GLOBAL_POSTGRES_USER_PROD" \
+  -e POSTGRES_PASSWORD="$GLOBAL_POSTGRES_PASS_PROD" \
+  --network "$PROD_NET" \
+  -v "$DATA_BASE_PATH/postgres-prod:/var/lib/postgresql/data" \
+  "$POSTGRES_IMAGE"
+
+{% if is_s3_needed -%}
+ensure_container "minio-dev" \
+  -e MINIO_ROOT_USER="$GLOBAL_MINIO_USER_DEV" \
+  -e MINIO_ROOT_PASSWORD="$GLOBAL_MINIO_PASS_DEV" \
+  --network "$DEV_NET" \
+  -v "$DATA_BASE_PATH/minio-dev:/data" \
+  -p 9001:9001 \
+  "$MINIO_IMAGE" \
+  server /data --console-address :9001
+ensure_container "minio-prod" \
+  -e MINIO_ROOT_USER="$GLOBAL_MINIO_USER_PROD" \
+  -e MINIO_ROOT_PASSWORD="$GLOBAL_MINIO_PASS_PROD" \
+  --network "$PROD_NET" \
+  -v "$DATA_BASE_PATH/minio-prod:/data" \
+  -p 9002:9001 \
+  "$MINIO_IMAGE" \
+  server /data --console-address :9001
+{% endif %}
+{% if is_redis_needed -%}
+ensure_container "redis-dev" \
+  --network "$DEV_NET" \
+  -v "$DATA_BASE_PATH/redis-dev:/data" \
+  "$REDIS_IMAGE" \
+  redis-server --requirepass "$GLOBAL_REDIS_PASS_DEV"
+ensure_container "redis-prod" \
+  --network "$PROD_NET" \
+  -v "$DATA_BASE_PATH/redis-prod:/data" \
+  "$REDIS_IMAGE" \
+  redis-server --requirepass "$GLOBAL_REDIS_PASS_PROD"
+{% endif %}
+{% if is_rabbitmq_needed -%}
+ensure_container "rabbitmq-dev" \
+  -e RABBITMQ_DEFAULT_USER="$GLOBAL_RABBITMQ_USER_DEV" \
+  -e RABBITMQ_DEFAULT_PASS="$GLOBAL_RABBITMQ_PASS_DEV" \
+  --network "$DEV_NET" \
+  -v "$DATA_BASE_PATH/rabbitmq-dev:/var/lib/rabbitmq" \
+  -p 15672:15672 \
+  "$RABBITMQ_IMAGE"
+ensure_container "rabbitmq-prod" \
+  -e RABBITMQ_DEFAULT_USER="$GLOBAL_RABBITMQ_USER_PROD" \
+  -e RABBITMQ_DEFAULT_PASS="$GLOBAL_RABBITMQ_PASS_PROD" \
+  --network "$PROD_NET" \
+  -v "$DATA_BASE_PATH/rabbitmq-prod:/var/lib/rabbitmq" \
+  -p 15673:15672 \
+  "$RABBITMQ_IMAGE"
+{% endif %}
+if [[ ! -f "$CREDENTIALS_PATH" ]]; then
+  log "Генерация учётных данных и портов для проекта $PROJECT_SLUG"
+
+  SUF_DEV=$(openssl rand -hex 4)
+  SUF_PROD=$(openssl rand -hex 4)
+
+  PROJECT_FRONTEND_PORT_DEV=$(find_free_port $FRONTEND_PORT_START)
+  PROJECT_FRONTEND_PORT_PROD=$(find_free_port $((PROJECT_FRONTEND_PORT_DEV + 1)))
+  PROJECT_BACKEND_PORT_DEV=$(find_free_port $BACKEND_PORT_START)
+  PROJECT_BACKEND_PORT_PROD=$(find_free_port $((PROJECT_BACKEND_PORT_DEV + 1)))
+
+  PROJECT_POSTGRES_DB_DEV="${PROJECT_SLUG}_dev"
+  PROJECT_POSTGRES_USER_DEV="${PROJECT_SLUG}_dev_user_${SUF_DEV}"
+  PROJECT_POSTGRES_PASS_DEV=$(generate_secret 32)
+  PROJECT_POSTGRES_DB_PROD="${PROJECT_SLUG}_prod"
+  PROJECT_POSTGRES_USER_PROD="${PROJECT_SLUG}_prod_user_${SUF_PROD}"
+  PROJECT_POSTGRES_PASS_PROD=$(generate_secret 32)
+
+  {% if is_s3_needed -%}
+  PROJECT_MINIO_BUCKET_DEV="${PROJECT_SLUG_DASH}-dev"
+  PROJECT_MINIO_BUCKET_PROD="${PROJECT_SLUG_DASH}-prod"
+  {% endif %}
+  {% if is_redis_needed -%}
+  PROJECT_REDIS_DB_DEV=${PROJECT_SLUG}-dev
+  PROJECT_REDIS_DB_PROD=${PROJECT_SLUG}-prod
+  {% endif %}
+  {% if is_rabbitmq_needed -%}
+  PROJECT_RABBIT_VHOST_DEV="/${PROJECT_SLUG}-dev"
+  PROJECT_RABBIT_USER_DEV="${PROJECT_SLUG}_dev_user"
+  PROJECT_RABBIT_PASS_DEV=$(generate_secret 32)
+  PROJECT_RABBIT_VHOST_PROD="/${PROJECT_SLUG}-prod"
+  PROJECT_RABBIT_USER_PROD="${PROJECT_SLUG}_prod_user"
+  PROJECT_RABBIT_PASS_PROD=$(generate_secret 32)
+  {% endif %}
+  cat >"$CREDENTIALS_PATH" <<EOF
+PROJECT_FRONTEND_PORT_DEV=$PROJECT_FRONTEND_PORT_DEV
+PROJECT_BACKEND_PORT_DEV=$PROJECT_BACKEND_PORT_DEV
+PROJECT_FRONTEND_PORT_PROD=$PROJECT_FRONTEND_PORT_PROD
+PROJECT_BACKEND_PORT_PROD=$PROJECT_BACKEND_PORT_PROD
+
+PROJECT_POSTGRES_DB_DEV=$PROJECT_POSTGRES_DB_DEV
+PROJECT_POSTGRES_USER_DEV=$PROJECT_POSTGRES_USER_DEV
+PROJECT_POSTGRES_PASS_DEV=$PROJECT_POSTGRES_PASS_DEV
+PROJECT_POSTGRES_DB_PROD=$PROJECT_POSTGRES_DB_PROD
+PROJECT_POSTGRES_USER_PROD=$PROJECT_POSTGRES_USER_PROD
+PROJECT_POSTGRES_PASS_PROD=$PROJECT_POSTGRES_PASS_PROD
+
+PROJECT_MINIO_BUCKET_DEV=$PROJECT_MINIO_BUCKET_DEV
+PROJECT_MINIO_BUCKET_PROD=$PROJECT_MINIO_BUCKET_PROD
+
+PROJECT_REDIS_DB_DEV=$PROJECT_REDIS_DB_DEV
+PROJECT_REDIS_DB_PROD=$PROJECT_REDIS_DB_PROD
+
+PROJECT_RABBIT_VHOST_DEV=$PROJECT_RABBIT_VHOST_DEV
+PROJECT_RABBIT_USER_DEV=$PROJECT_RABBIT_USER_DEV
+PROJECT_RABBIT_PASS_DEV=$PROJECT_RABBIT_PASS_DEV
+PROJECT_RABBIT_VHOST_PROD=$PROJECT_RABBIT_VHOST_PROD
+PROJECT_RABBIT_USER_PROD=$PROJECT_RABBIT_USER_PROD
+PROJECT_RABBIT_PASS_PROD=$PROJECT_RABBIT_PASS_PROD
+EOF
+  chmod 600 "$CREDENTIALS_PATH"
+  chown root:root "$CREDENTIALS_PATH"
+else
+  log "Загрузка существующих креденшалов для проекта $PROJECT_SLUG"
+  source "$CREDENTIALS_PATH"
+fi
+
+log "Ожидание 30 секунд..."
+sleep 30
+
+log "Создание баз данных и пользователей PostgreSQL"
+docker exec -i postgres-dev psql -U "$GLOBAL_POSTGRES_USER_DEV" -c "CREATE DATABASE $PROJECT_POSTGRES_DB_DEV;" 2>/dev/null || log "База $PROJECT_POSTGRES_DB_DEV уже существует"
+docker exec -i postgres-dev psql -U "$GLOBAL_POSTGRES_USER_DEV" -c "CREATE USER $PROJECT_POSTGRES_USER_DEV WITH PASSWORD '$PROJECT_POSTGRES_PASS_DEV';" 2>/dev/null || log "Пользователь $PROJECT_POSTGRES_USER_DEV уже существует"
+docker exec -i postgres-dev psql -U "$GLOBAL_POSTGRES_USER_DEV" -c "GRANT ALL PRIVILEGES ON DATABASE $PROJECT_POSTGRES_DB_DEV TO $PROJECT_POSTGRES_USER_DEV;" 2>/dev/null
+docker exec -i postgres-dev psql -U "$GLOBAL_POSTGRES_USER_DEV" -d "$PROJECT_POSTGRES_DB_DEV" -c "GRANT USAGE, CREATE ON SCHEMA public TO $PROJECT_POSTGRES_USER_DEV;" &>/dev/null || log "Не удалось предоставить привилегии на схему public для $PROJECT_POSTGRES_USER_DEV"
+
+docker exec -i postgres-prod psql -U "$GLOBAL_POSTGRES_USER_PROD" -c "CREATE DATABASE $PROJECT_POSTGRES_DB_PROD;" 2>/dev/null || log "База $PROJECT_POSTGRES_DB_PROD уже существует"
+docker exec -i postgres-prod psql -U "$GLOBAL_POSTGRES_USER_PROD" -c "CREATE USER $PROJECT_POSTGRES_USER_PROD WITH PASSWORD '$PROJECT_POSTGRES_PASS_PROD';" 2>/dev/null || log "Пользователь $PROJECT_POSTGRES_USER_PROD уже существует"
+docker exec -i postgres-prod psql -U "$GLOBAL_POSTGRES_USER_PROD" -c "GRANT ALL PRIVILEGES ON DATABASE $PROJECT_POSTGRES_DB_PROD TO $PROJECT_POSTGRES_USER_PROD;" 2>/dev/null
+docker exec -i postgres-prod psql -U "$GLOBAL_POSTGRES_USER_PROD" -d "$PROJECT_POSTGRES_DB_PROD" -c "GRANT USAGE, CREATE ON SCHEMA public TO $PROJECT_POSTGRES_USER_PROD;" &>/dev/null || log "Не удалось предоставить привилегии на схему public для $PROJECT_POSTGRES_USER_PROD"
+
+{% if is_s3_needed -%}
+log "Создание бакетов MinIO"
+docker exec minio-dev mc mb local/$PROJECT_MINIO_BUCKET_DEV 2>/dev/null || log "Бакет $PROJECT_MINIO_BUCKET_DEV уже существует"
+docker exec minio-prod mc mb local/$PROJECT_MINIO_BUCKET_PROD 2>/dev/null || log "Бакет $PROJECT_MINIO_BUCKET_PROD уже существует"
+{% endif %}
+{% if is_rabbitmq_needed -%}
+log "Создание vhost и пользователей RabbitMQ"
+docker exec rabbitmq-dev rabbitmqctl add_vhost "$PROJECT_RABBIT_VHOST_DEV" 2>/dev/null || log "Vhost $PROJECT_RABBIT_VHOST_DEV уже существует"
+docker exec rabbitmq-dev rabbitmqctl add_user "$PROJECT_RABBIT_USER_DEV" "$PROJECT_RABBIT_PASS_DEV" 2>/dev/null || log "Пользователь $PROJECT_RABBIT_USER_DEV уже существует"
+docker exec rabbitmq-dev rabbitmqctl set_permissions -p "$PROJECT_RABBIT_VHOST_DEV" "$PROJECT_RABBIT_USER_DEV" ".*" ".*" ".*"
+
+docker exec rabbitmq-prod rabbitmqctl add_vhost "$PROJECT_RABBIT_VHOST_PROD" 2>/dev/null || log "Vhost $PROJECT_RABBIT_VHOST_PROD уже существует"
+docker exec rabbitmq-prod rabbitmqctl add_user "$PROJECT_RABBIT_USER_PROD" "$PROJECT_RABBIT_PASS_PROD" 2>/dev/null || log "Пользователь $PROJECT_RABBIT_USER_PROD уже существует"
+docker exec rabbitmq-prod rabbitmqctl set_permissions -p "$PROJECT_RABBIT_VHOST_PROD" "$PROJECT_RABBIT_USER_PROD" ".*" ".*" ".*"
+{% endif %}
+log "Настройка Nginx"
+cat >/etc/nginx/sites-available/containers.conf <<EOF
+server {
+    listen 80;
+    server_name rabbitmq-dev.${DOMAIN};
+    location / {
+        proxy_pass http://127.0.0.1:15672;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+    }
+}
+
+server {
+    listen 80;
+    server_name rabbitmq-prod.${DOMAIN};
+    location / {
+        proxy_pass http://127.0.0.1:15673;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+    }
+}
+
+server {
+    listen 80;
+    server_name minio-dev.${DOMAIN};
+    location / {
+        proxy_pass http://127.0.0.1:9001;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+    }
+}
+
+server {
+    listen 80;
+    server_name minio-prod.${DOMAIN};
+    location / {
+        proxy_pass http://127.0.0.1:9002;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+    }
+}
+EOF
+ln -sf /etc/nginx/sites-available/containers.conf /etc/nginx/sites-enabled/
+
+log "Настройка Nginx для проекта $PROJECT_SLUG"
+cat >/etc/nginx/sites-available/${PROJECT_SLUG}.conf <<EOF
+server {
+    listen 80;
+    server_name ${PROJECT_SLUG_DASH}.${DOMAIN};
+    location / {
+        proxy_pass http://127.0.0.1:${PROJECT_FRONTEND_PORT_PROD};
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+    }
+}
+
+server {
+    listen 80;
+    server_name ${PROJECT_SLUG_DASH}-dev.${DOMAIN};
+    location / {
+        proxy_pass http://127.0.0.1:${PROJECT_FRONTEND_PORT_DEV};
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+    }
+}
+
+server {
+    listen 80;
+    server_name ${PROJECT_SLUG_DASH}-backend.${DOMAIN};
+    location / {
+        proxy_pass http://127.0.0.1:${PROJECT_BACKEND_PORT_PROD};
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+    }
+}
+
+server {
+    listen 80;
+    server_name ${PROJECT_SLUG_DASH}-backend-dev.${DOMAIN};
+    location / {
+        proxy_pass http://127.0.0.1:${PROJECT_BACKEND_PORT_DEV};
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+    }
+}
+EOF
+ln -sf /etc/nginx/sites-available/${PROJECT_SLUG}.conf /etc/nginx/sites-enabled/
+nginx -t && systemctl reload nginx
+
+log "Содержимое $GLOBAL_CREDS_PATH:"
+cat "$GLOBAL_CREDS_PATH"
+
+log "Содержимое $CREDENTIALS_PATH:"
+cat "$CREDENTIALS_PATH"
+
+log "Скрипт завершён успешно для проекта $PROJECT_SLUG"

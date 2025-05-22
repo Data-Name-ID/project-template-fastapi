@@ -1,0 +1,78 @@
+<!DOCTYPE html>
+<html lang="ru">
+  <head>
+    <meta charset="UTF-8" />
+    <title>Подтверждение аккаунта</title>
+    <style>
+      * {
+        font-size: 18px;
+      }
+      body {
+        font-family: Arial, sans-serif;
+        background-color: #f4f4f7;
+        margin: 0;
+        padding: 30px;
+      }
+      .container {
+        max-width: 600px;
+        margin: 0 auto;
+        background-color: #ffffff;
+        border-radius: 8px;
+        box-shadow: 0 4px 12px rgba(0, 0, 0, 0.1);
+        padding: 30px;
+      }
+      h1 {
+        color: #0056b3;
+        font-size: 28px;
+        text-align: center;
+        margin-bottom: 20px;
+      }
+      p {
+        margin: 15px 0;
+      }
+      .confirm-button {
+        display: inline-block;
+        margin: 10px 0;
+        padding: 12px 24px;
+        background-color: #0056b3;
+        color: #ffffff;
+        text-decoration: none;
+        font-size: 16px;
+        font-weight: bold;
+        border-radius: 5px;
+        text-align: center;
+      }
+      .confirm-button:hover {
+        background-color: #003a82;
+      }
+      .footer {
+        font-size: 12px !important;
+        color: #666666;
+        text-align: center;
+        border-top: 1px solid #eeeeee;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="container">
+      <h1>Подтверждение аккаунта</h1>
+      <p>Здравствуйте!</p>
+      <p>
+        Вы получили это письмо, так как Ваш адрес электронной почты был указан
+        при регистрации на нашем сайте.
+      </p>
+      <p>
+        Для подтверждения аккаунта нажмите кнопку ниже. Ссылка действительна в
+        течение суток, при необходимости вы можете запросить новое письмо для
+        подтверждения аккаунта на <a href="{{ base_url }}">главной странице</a>.
+      </p>
+      <p style="text-align: center">
+        <a href="{{ url }}" class="confirm-button"> Подтвердить почту </a>
+      </p>
+      <p>Если вы не регистрировались, просто проигнорируйте это сообщение.</p>
+      <div class="footer">
+        <p>С уважением,<br />команда</p>
+      </div>
+    </div>
+  </body>
+</html>

@@ -1,0 +1,59 @@
+from collections.abc import AsyncGenerator
+from contextlib import asynccontextmanager
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, BinaryIO
+from uuid import uuid4
+
+from aiobotocore.session import get_session
+
+from app.core.store import Store
+
+
+@dataclass
+class FileInfo:
+    url: Path
+    key: Path
+
+
+class S3Accessor:
+    def __init__(self, store: Store) -> None:
+        self.store = store
+
+        self.endpoint = store.config.s3.endpoint
+        self.secret_key = store.config.s3.secret_key
+        self.access_key = store.config.s3.access_key
+        self.bucket = store.config.s3.bucket
+
+        self.session = get_session()
+
+    @asynccontextmanager
+    async def _create_client(self) -> AsyncGenerator[Any, None]:
+        async with self.session.create_client(
+            "s3",
+            endpoint_url=self.endpoint,
+            aws_secret_access_key=self.secret_key,
+            aws_access_key_id=self.access_key,
+        ) as client:
+            yield client
+
+    def generate_file_info(self, path: str, filename: str) -> FileInfo:
+        suffix = Path(filename).suffix
+        uuid_filename = uuid4().hex + suffix
+
+        key = Path(path) / uuid_filename
+        url = Path(self.endpoint) / self.bucket / key
+
+        return FileInfo(url=url, key=key)
+
+    def get_key_from_url(self, url: str) -> str:
+        path = Path(self.endpoint) / self.bucket
+        return url.removeprefix(path.as_posix() + "/")
+
+    async def put(self, file: BinaryIO, key: str) -> None:
+        async with self._create_client() as client:
+            await client.put_object(Bucket=self.bucket, Key=key, Body=file)
+
+    async def delete(self, key: str) -> None:
+        async with self._create_client() as client:
+            await client.delete_object(Bucket=self.bucket, Key=key)

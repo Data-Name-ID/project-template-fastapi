@@ -1,0 +1,33 @@
+from typing import Any, TypeVar, cast
+
+from google import genai
+from google.genai import types
+
+from app.core.store import Store
+
+_T = TypeVar("_T", bound=Any)
+
+
+class AIAccessor:
+    def __init__(self, store: Store) -> None:
+        self.store = store
+
+        self.client = genai.Client(api_key=store.config.ai.api_key)
+
+    async def generate_content(
+        self,
+        contents: str,
+        output_model: type[_T],
+        system_instruction: str | None = None,
+        model: str | None = None,
+    ) -> _T:
+        response = await self.client.aio.models.generate_content(
+            model=model or self.default_model,
+            contents=contents,
+            config=types.GenerateContentConfig(
+                system_instruction=system_instruction,
+                response_mime_type="application/json",
+                response_schema=output_model,
+            ),
+        )
+        return cast(_T, response.parsed)
